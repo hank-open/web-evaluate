@@ -1,12 +1,13 @@
 ---
 name: web-evaluate
-version: 1.1.0
+version: 1.2.0
 description: |
   Web 端页面性能评估与优化建议。分析目标 URL 的 Core Web Vitals、
-  资源加载、渲染阻塞、JS/CSS 体积、缓存策略等，生成可执行的优化报告（Markdown 或 HTML 格式）。
+  资源加载、渲染阻塞、JS/CSS 体积、缓存策略等，生成可执行的优化报告。
+  支持 Markdown / HTML 报告格式，历史对比模式，确定性评分公式。
   Use when: "性能评估", "页面优化", "web vitals", "加载慢", "性能诊断",
   "LCP", "FID", "CLS", "TTI", "bundle size", "performance audit",
-  "生成性能报告", "html 报告", "markdown 报告".
+  "生成性能报告", "html 报告", "markdown 报告", "对比上次".
   Voice triggers: "帮我评估页面性能", "页面加载太慢", "web performance audit", "生成性能报告".
 triggers:
   - web 性能评估
@@ -16,6 +17,7 @@ triggers:
   - 页面优化建议
   - 生成性能报告
   - html 性能报告
+  - 对比上次评估
 allowed-tools:
   - Bash
   - Read
@@ -28,123 +30,332 @@ allowed-tools:
 
 Web 端页面性能全面评估与优化建议 skill。
 
----
+**支持参数：**
+```
+/web-evaluate <URL> [--mobile] [--desktop] [--html] [--md] [--both] [--quick] [--compare]
+```
 
-## 工作流
-
-### Phase 0: 收集目标信息
-
-通过 AskUserQuestion 收集：
-
-1. **目标 URL** — 要评估的页面地址
-2. **设备类型** — Mobile / Desktop / 两者
-3. **评估重点** — 全面诊断 / 加载速度 / 渲染性能 / 资源优化 / 缓存策略
-
-**STOP**，等待用户回答后继续。
+- `--mobile` / `--desktop`：指定设备类型（默认 desktop）
+- `--html` / `--md` / `--both`：指定报告格式（默认询问）
+- `--quick`：跳过子资源大小测量，仅做 HTTP 头快速分析
+- `--compare`：与上次同 URL 的评估结果对比差异
 
 ---
 
-### Phase 1: 环境探测
+## Phase 0: 智能参数解析
+
+从用户输入中自动提取参数，**已提供的参数跳过交互提问**。
 
 ```bash
-# 检测项目类型（如在项目目录下运行）
+# 解析逻辑（伪代码，由 AI 执行）
+ARGS="<用户输入的完整命令>"
+
+# 1. 提取 URL（以 http/https 开头的片段）
+TARGET_URL=$(echo "$ARGS" | grep -oE 'https?://[^ ]+')
+
+# 2. 解析 flags
+[[ "$ARGS" == *"--mobile"*  ]] && DEVICE="mobile"   || DEVICE="desktop"
+[[ "$ARGS" == *"--html"*   ]] && FORMAT="html"
+[[ "$ARGS" == *"--md"*     ]] && FORMAT="md"
+[[ "$ARGS" == *"--both"*   ]] && FORMAT="both"
+[[ "$ARGS" == *"--quick"*  ]] && MODE="quick"        || MODE="full"
+[[ "$ARGS" == *"--compare"*]] && COMPARE="true"      || COMPARE="false"
+
+echo "TARGET_URL: $TARGET_URL"
+echo "DEVICE: $DEVICE"
+echo "FORMAT: ${FORMAT:-unset}"
+echo "MODE: $MODE"
+echo "COMPARE: $COMPARE"
+```
+
+**只在参数缺失时才提问：**
+- 未提供 URL → AskUserQuestion 询问目标地址
+- 未提供 `--html/--md/--both` → Phase 5 时询问报告格式
+- 其余参数使用默认值，不打断流程
+
+---
+
+## Phase 1: 环境探测
+
+```bash
 _PROJ_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "standalone")
 echo "PROJECT_ROOT: $_PROJ_ROOT"
 
-# 检查是否有 package.json 判断前端框架
 if [ -f "$_PROJ_ROOT/package.json" ]; then
-  cat "$_PROJ_ROOT/package.json" | grep -E '"(react|vue|next|nuxt|vite|webpack|name|version)"' | head -10
+  grep -E '"(react|vue|next|nuxt|vite|webpack|name|version)"' "$_PROJ_ROOT/package.json" | head -10
 fi
 
-# 检查 browse 工具
-_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
-B=""
-[ -n "$_ROOT" ] && [ -x "$_ROOT/.claude/skills/gstack/browse/dist/browse" ] && B="$_ROOT/.claude/skills/gstack/browse/dist/browse"
-[ -z "$B" ] && B="$HOME/.claude/skills/gstack/browse/dist/browse"
+B="$HOME/.claude/skills/gstack/browse/dist/browse"
 [ -x "$B" ] && echo "BROWSE_READY: $B" || echo "BROWSE_NOT_AVAILABLE"
 ```
 
 ---
 
-### Phase 2: 性能数据采集
+## Phase 2: 性能数据采集
 
-根据用户提供的 URL，执行以下采集步骤（每项均输出结构化数据）：
-
-#### 2.1 HTTP 头信息分析
+### 2.1 HTTP 指标（必做）
 
 ```bash
-TARGET_URL="<用户输入的URL>"
+# 3次 TTFB 采样取平均，排除网络抖动
+for i in 1 2 3; do
+  curl -o /dev/null -s --max-time 15 \
+    -w "Run$i TTFB:%{time_starttransfer} DNS:%{time_namelookup} Connect:%{time_connect} TLS:%{time_appconnect} Total:%{time_total} Size:%{size_download} Status:%{http_code}\n" \
+    "$TARGET_URL"
+done
 
-# 获取响应头
-curl -I -L --max-time 10 -s "$TARGET_URL" | head -30
-
-# 测量首字节时间 TTFB
-curl -o /dev/null -s -w "TTFB: %{time_starttransfer}s\nTotal: %{time_total}s\nDNS: %{time_namelookup}s\nConnect: %{time_connect}s\nTLS: %{time_appconnect}s\nSize: %{size_download} bytes\nStatus: %{http_code}\n" "$TARGET_URL"
+# 响应头：缓存 / 压缩 / HTTP 版本
+curl -I -L --max-time 10 -s "$TARGET_URL"
 ```
 
-#### 2.2 资源清单抓取
+计算 TTFB 均值，用于 Phase 3 评分。
 
-用 WebFetch 抓取页面 HTML，分析：
-- `<script>` 标签数量和 `async`/`defer` 使用情况
+### 2.2 资源清单（抓取原始 HTML）
+
+```bash
+curl -s --max-time 15 "$TARGET_URL"
+```
+
+从 HTML 中提取：
+- `<script>` 数量，有无 `async`/`defer`/`type="module"`
 - `<link rel="stylesheet">` 数量
-- `<img>` 标签是否有 `loading="lazy"` 和 `width`/`height` 属性
-- `<link rel="preload">` / `<link rel="prefetch">` 使用情况
-- `<meta>` viewport 配置
-- 是否有第三方脚本（广告、分析、聊天工具）
+- `<link rel="modulepreload">` / `<link rel="preload">` 使用情况
+- `<img>` 是否有 `loading="lazy"` 和 `width`/`height`
+- `<meta name="viewport">` 内容
+- 第三方域名脚本数量
+- HTML 内联 SVG / 内联 style 大小
 
-#### 2.3 响应头缓存分析
+### 2.3 子资源大小测量（`--quick` 时跳过）
 
-从 curl 响应头中提取：
-- `Cache-Control` / `Expires` 策略
-- `ETag` / `Last-Modified` 验证缓存
-- `Content-Encoding`（gzip/br 压缩）
-- `Content-Security-Policy`
-- HTTP 版本（HTTP/1.1 vs HTTP/2 vs HTTP/3）
-
----
-
-### Phase 3: 性能指标评分
-
-根据采集到的数据，对以下 Core Web Vitals 和关键指标进行评分：
-
-| 指标 | 含义 | Good | Needs Improvement | Poor |
-|------|------|------|-------------------|------|
-| **LCP** (最大内容绘制) | 主要内容加载速度 | ≤2.5s | 2.5–4s | >4s |
-| **FID/INP** (交互延迟) | 首次输入响应 | ≤100ms | 100–300ms | >300ms |
-| **CLS** (累计布局偏移) | 视觉稳定性 | ≤0.1 | 0.1–0.25 | >0.25 |
-| **TTFB** (首字节时间) | 服务器响应 | ≤800ms | 800ms–1.8s | >1.8s |
-| **FCP** (首次内容绘制) | 首屏出现时间 | ≤1.8s | 1.8–3s | >3s |
-| **TTI** (可交互时间) | 完全可交互 | ≤3.8s | 3.8–7.3s | >7.3s |
-
-评分输出格式：
-```
-SCORE CARD:
-  TTFB:    [GOOD/WARN/POOR] Xms
-  压缩:    [ON/OFF] gzip/br/none
-  HTTP版本:[HTTP/1.1|HTTP/2|HTTP/3]
-  缓存:    [CONFIGURED/MISSING]
-  图片懒加载: [YES/NO/PARTIAL]
-  脚本优化: [GOOD/WARN/POOR] (async/defer使用率)
-  第三方脚本: [X个] (风险提示)
+```bash
+# 从 HTML 中提取所有 /assets/*.js 和 /assets/*.css
+# 逐一测量原始大小和 gzip 传输大小
+for chunk in $CHUNKS; do
+  raw=$(curl -I -s --max-time 10 "$BASE$chunk" | grep -i "content-length" | awk '{print $2}' | tr -d '\r')
+  gz=$(curl -o /dev/null -s --max-time 20 -H "Accept-Encoding: gzip, deflate, br" -w "%{size_download}" "$BASE$chunk")
+  cc=$(curl -I -s --max-time 10 "$BASE$chunk" | grep -i "cache-control" | tr -d '\r')
+  echo "$chunk | raw=${raw}B | gz=${gz}B | $cc"
+done
 ```
 
 ---
 
-### Phase 4: 问题诊断与优化建议
+## Phase 2.5: 历史记录对比
+
+历史数据保存路径：`$HOME/.gstack/web-evaluate/history.jsonl`
+
+每条记录格式（单行 JSON）：
+```json
+{
+  "ts": "2026-07-14T15:40:00Z",
+  "url": "https://example.com/",
+  "ttfb_ms": 881,
+  "total_raw_kb": 5205,
+  "total_gz_kb": 1259,
+  "score": 47,
+  "http_version": "2",
+  "cache": false,
+  "compression": "gzip",
+  "critical": 4,
+  "warning": 4
+}
+```
+
+**加载历史并对比（`--compare` 或自动检测同 URL 历史）：**
+
+```bash
+HISTORY_FILE="$HOME/.gstack/web-evaluate/history.jsonl"
+
+# 查找同 URL 的最近一条记录
+if [ -f "$HISTORY_FILE" ]; then
+  PREV=$(grep "\"url\":\"$TARGET_URL\"" "$HISTORY_FILE" | tail -1)
+  if [ -n "$PREV" ]; then
+    echo "HISTORY_FOUND: $PREV"
+  else
+    echo "HISTORY_NOT_FOUND"
+  fi
+fi
+```
+
+**若找到历史记录，在报告顶部输出对比表：**
+
+```
+┌─────────────────┬──────────────┬──────────────┬──────────────┐
+│ 指标             │ 上次 (日期)   │ 本次          │ 变化          │
+├─────────────────┼──────────────┼──────────────┼──────────────┤
+│ 总评分           │ 47           │ XX           │ ▲/▼ +N       │
+│ TTFB            │ 881ms        │ XXXms        │ ▲/▼ ±Xms     │
+│ 传输总量         │ 1,259 KB     │ X,XXX KB     │ ▲/▼ ±X KB    │
+│ CRITICAL 数      │ 4            │ X            │ ▲/▼ ±N       │
+│ 缓存             │ 未配置        │ XX           │              │
+└─────────────────┴──────────────┴──────────────┴──────────────┘
+```
+
+若无历史记录，本次评估完成后自动保存（无需提示用户）。
+
+**历史写入（每次评估结束时执行）：**
+
+```bash
+HISTORY_FILE="$HOME/.gstack/web-evaluate/history.jsonl"
+mkdir -p "$(dirname $HISTORY_FILE)"
+echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"url\":\"$TARGET_URL\",\"ttfb_ms\":TTFB,\"total_raw_kb\":RAW_KB,\"total_gz_kb\":GZ_KB,\"score\":SCORE,\"http_version\":\"HTTP_VER\",\"cache\":CACHE_BOOL,\"compression\":\"COMP\",\"critical\":N_CRITICAL,\"warning\":N_WARNING}" \
+  >> "$HISTORY_FILE"
+```
+
+---
+
+## Phase 3: 确定性评分公式
+
+总分 100 分，各维度独立计算，**分值由明确数值规则决定，不依赖模型判断**。
+
+### 3.1 各维度满分与规则
+
+#### A. 加载速度 — 35 分
+
+**TTFB（15分）**
+| TTFB 均值 | 得分 |
+|-----------|------|
+| ≤ 200ms   | 15   |
+| ≤ 500ms   | 12   |
+| ≤ 800ms   | 9    |
+| ≤ 1200ms  | 5    |
+| ≤ 1800ms  | 2    |
+| > 1800ms  | 0    |
+
+**FCP 估算（10分）** — 基于 TTFB + 传输大小推算
+| FCP 估算  | 得分 |
+|-----------|------|
+| ≤ 1.8s    | 10   |
+| ≤ 3.0s    | 6    |
+| ≤ 4.5s    | 3    |
+| > 4.5s    | 0    |
+
+FCP 估算公式：`FCP ≈ TTFB + gz_total_kb / 下行速度(10Mbps估算) + JS解析时间估算`  
+JS 解析时间估算：`raw_js_mb × 500ms/MB`（Chrome V8 基准）
+
+**LCP 估算（10分）** — SPA 项目 LCP ≈ TTI，公式同上加 JS 执行时间
+| LCP 估算  | 得分 |
+|-----------|------|
+| ≤ 2.5s    | 10   |
+| ≤ 4.0s    | 6    |
+| ≤ 6.0s    | 3    |
+| > 6.0s    | 0    |
+
+#### B. 交互响应 — 25 分
+
+**TTI 估算（15分）** — `TTFB + 传输时间 + JS解析时间`
+| TTI 估算  | 得分 |
+|-----------|------|
+| ≤ 3.8s    | 15   |
+| ≤ 5.0s    | 10   |
+| ≤ 7.3s    | 5    |
+| > 7.3s    | 0    |
+
+**JS Bundle 合理性（10分）**
+| JS 总原始大小 | 得分 |
+|--------------|------|
+| ≤ 500 KB     | 10   |
+| ≤ 1 MB       | 7    |
+| ≤ 2 MB       | 4    |
+| ≤ 4 MB       | 2    |
+| > 4 MB       | 0    |
+
+#### C. 视觉稳定性 — 20 分
+
+**CLS（10分）** — 无法静态测量时得 5 分（中立）；若检测到无 img width/height 减 2 分；无 aspect-ratio 减 1 分。
+
+**CSS 体积合理性（10分）**
+| CSS 总原始大小 | 得分 |
+|---------------|------|
+| ≤ 50 KB       | 10   |
+| ≤ 150 KB      | 7    |
+| ≤ 400 KB      | 4    |
+| > 400 KB      | 1    |
+
+#### D. 网络优化 — 20 分
+
+**缓存策略（8分）**
+| 情况 | 得分 |
+|------|------|
+| 静态资源有 `Cache-Control: immutable` 或 `max-age≥31536000` | 8 |
+| 有 `Cache-Control` 但 max-age < 1年 | 4 |
+| 仅有 `ETag` / `Last-Modified` | 1 |
+| 完全无缓存头 | 0 |
+
+**压缩（6分）**
+| 情况 | 得分 |
+|------|------|
+| Brotli (br) | 6 |
+| gzip        | 4 |
+| 无压缩       | 0 |
+
+**HTTP 版本（4分）**
+| 版本 | 得分 |
+|------|------|
+| HTTP/3 | 4 |
+| HTTP/2 | 3 |
+| HTTP/1.1 | 0 |
+
+**第三方脚本扣分（上限 -4分）**
+- 每个第三方脚本域名 -1 分
+
+### 3.2 评分等级
+
+| 总分     | 等级    | 颜色   |
+|----------|---------|--------|
+| 90–100   | 优秀    | 🟢 green  |
+| 75–89    | 良好    | 🟡 yellow |
+| 60–74    | 待改进  | 🟠 orange |
+| 0–59     | 较差    | 🔴 red    |
+
+### 3.3 输出明细
+
+评分完成后，**必须逐项列出每维度的得分和扣分原因**：
+
+```
+=== 评分明细 ===
+A. 加载速度 (35分满分)
+   TTFB 881ms           → 5/15
+   FCP 估算 ~3s          → 6/10
+   LCP 估算 ~4s          → 6/10
+   小计: 17/35
+
+B. 交互响应 (25分满分)
+   TTI 估算 ~6s          → 5/15
+   JS Bundle 5.2MB       → 0/10
+   小计: 5/25
+
+C. 视觉稳定性 (20分满分)
+   CLS (静态中立)        → 5/10
+   CSS 702KB             → 1/10
+   小计: 6/20
+
+D. 网络优化 (20分满分)
+   缓存: 无 Cache-Control → 0/8
+   压缩: gzip            → 4/6
+   HTTP/2               → 3/4
+   第三方脚本: 0个       → 0扣分
+   小计: 7/20  (实际: 7/20)
+
+总分: 17+5+6+7 = 35/100  ← 注：此为示例，实际按真实数据计算
+```
+
+---
+
+## Phase 4: 问题诊断与优化建议
 
 针对每个发现的问题，输出标准化建议条目：
 
 ```
 [CRITICAL] 问题标题
   现状: 具体描述（数字/比例）
-  影响: 对用户体验的实际影响
+  影响: 对用户体验的实际影响（关联哪个评分维度扣了几分）
   修复: 具体可执行的代码或配置方案
-  预期收益: 优化后预计提升幅度
+  预期收益: 修复后该维度可新增 +N 分，总分预计 +N
 
 [WARNING] 问题标题
   ...
 
-[INFO] 问题标题
+[INFO] 问题标题（不影响评分，但值得关注）
   ...
 ```
 
@@ -178,11 +389,9 @@ SCORE CARD:
 
 ---
 
-### Phase 5: 生成优化报告
+## Phase 5: 生成优化报告
 
-首先询问用户偏好的报告格式（若用户在命令中已指定格式则跳过询问）：
-
-通过 AskUserQuestion 询问：
+若用户未在命令中指定格式（无 `--html`/`--md`/`--both`），通过 AskUserQuestion 询问一次：
 - A) Markdown 报告（.md）— 适合存档、版本控制、粘贴到文档
 - B) HTML 报告（.html）— 可视化仪表盘，浏览器直接打开，含进度条和颜色评级
 - C) 两者都生成
@@ -205,14 +414,21 @@ HTML_FILE="$REPORT_DIR/report-$TIMESTAMP.html"
 **设备类型:** {mobile/desktop}
 **项目识别:** {framework}
 
-## 执行摘要
+## 历史对比（若有）
 
-总体评分: X/100
-核心问题: N 个 CRITICAL，M 个 WARNING，K 个 INFO
+| 指标 | 上次 | 本次 | 变化 |
+...
+
+## 评分明细
+
+总分: X/100 — {等级}
+
+| 维度 | 得分 | 满分 |
+...（逐项明细）
 
 ## SCORE CARD
 
-TTFB / 压缩 / HTTP版本 / 缓存 / 脚本优化 / 第三方脚本
+...
 
 ## 资源加载总览
 
@@ -221,20 +437,20 @@ TTFB / 压缩 / HTTP版本 / 缓存 / 脚本优化 / 第三方脚本
 
 ## Core Web Vitals 估算
 
-| 指标 | 估算值 | 评级 |
+| 指标 | 估算值 | 评级 | 对应评分 |
 ...
 
 ## 详细诊断
 
-### CRITICAL 问题（含修复代码）
+### CRITICAL 问题（含修复代码 + 可新增分值）
 ### WARNING 问题
 ### INFO
 
 ## 优化优先级路线图
 
-### 第一阶段（1–2天，收益最高）
-### 第二阶段（3–5天）
-### 第三阶段（1–2周）
+### 第一阶段（1–2天，收益最高，预计 +N 分）
+### 第二阶段（3–5天，预计 +N 分）
+### 第三阶段（1–2周，预计 +N 分）
 
 ## 参考资源
 ```
@@ -242,63 +458,45 @@ TTFB / 压缩 / HTTP版本 / 缓存 / 脚本优化 / 第三方脚本
 #### HTML 报告结构
 
 HTML 报告为单文件自包含（无外部依赖），包含：
-- **头部仪表盘** — 总分圆形进度条（SVG），CRITICAL/WARNING/INFO 计数徽章
-- **Score Card 网格** — 每个指标卡片显示颜色评级（绿/黄/红）+ 图标
-- **资源瀑布图** — 横向条形图展示各 chunk 大小（原始 vs 传输）
-- **Core Web Vitals 卡片** — 彩色仪表盘显示各指标状态
-- **问题列表** — 可折叠的 accordion，CRITICAL 默认展开，含代码块
-- **路线图时间轴** — 三阶段竖向时间轴
-- **样式** — 内联 CSS，深色/亮色主题，打印友好
+- **头部仪表盘** — 总分 SVG 圆形进度条，历史趋势迷你折线图（有历史时显示），CRITICAL/WARNING/INFO 徽章
+- **历史对比表** — 有历史记录时显示 delta 行（↑↓ 箭头 + 颜色）
+- **评分明细表** — 每个维度的得分/满分/扣分原因
+- **Score Card 网格** — 每个指标卡片，颜色评级（绿/黄/红）
+- **资源瀑布图** — 横向条形图，原始 vs 传输大小
+- **Core Web Vitals 卡片** — 彩色状态卡
+- **问题列表** — 可折叠 accordion，CRITICAL 默认展开，含代码块，标注 "+N分" 潜在收益
+- **路线图时间轴** — 三阶段，标注每阶段完成后预计总分
+- **样式** — 内联 CSS，深色主题，打印友好
 
 生成 HTML 后自动在浏览器打开：
 ```bash
 open "$HTML_FILE"
 ```
 
-告知用户报告路径：
-- Markdown: `报告已保存到: {MD_FILE}`
-- HTML: `报告已保存到: {HTML_FILE}（已在浏览器打开）`
-
 ---
 
-### Phase 6: 交互式深入分析（可选）
+## Phase 6: 交互式深入分析（可选）
 
 通过 AskUserQuestion 询问用户是否需要对某个问题深入分析：
 
 - **图片优化** — 提供具体图片压缩和格式转换的 shell 脚本
 - **Bundle 分析** — 根据项目框架提供具体 webpack/vite 配置
-- **缓存配置** — 生成 Nginx / Caddy / Vercel 的缓存头配置
+- **缓存配置** — 生成 Nginx / Caddy / Vercel / Cloudflare 的完整缓存配置
 - **服务器端渲染** — 评估是否适合 SSR/SSG 迁移
-- **监控接入** — 接入 Web Vitals 实时监控的代码方案
+- **监控接入** — 接入 Web Vitals RUM 监控的代码方案（web-vitals.js）
+- **安全头检测** — HSTS / CSP / X-Frame-Options / Referrer-Policy 配置
 
 **STOP**，等待用户选择后提供对应的详细方案。
 
 ---
 
-## 评分算法
-
-总分 = 加权平均各维度得分（满分 100）
-
-| 维度 | 权重 |
-|------|------|
-| 加载速度 (TTFB + FCP + LCP) | 35% |
-| 交互响应 (FID/INP + TTI) | 25% |
-| 视觉稳定性 (CLS) | 20% |
-| 网络优化 (压缩 + 缓存 + HTTP版本) | 20% |
-
-等级：
-- 90–100: 优秀 (green)
-- 75–89:  良好 (yellow)
-- 60–74:  待改进 (orange)
-- 0–59:   较差 (red)
-
----
-
 ## 局限性说明
 
-此 skill 基于静态 HTTP 分析，无法测量：
+此 skill 基于静态 HTTP 分析（curl），无法测量：
 - 真实用户的 JavaScript 执行时间（需 RUM 工具）
 - 动态渲染内容的 CLS（需浏览器运行时）
 - 精确的 LCP 元素识别（需 browse 工具配合）
 
-如需精确的实验室数据，建议配合 `/benchmark` skill 或使用 [PageSpeed Insights](https://pagespeed.web.dev/) 进行完整测量。
+FCP / LCP / TTI 均为基于网络传输时间 + JS 体积的**估算值**，实际值因设备性能、网络环境差异较大。
+
+如需精确的实验室数据，建议通过 [PageSpeed Insights](https://pagespeed.web.dev/) 进行完整测量，或配合 `/benchmark` skill 使用。
